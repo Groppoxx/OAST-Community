@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import getpass
 import hashlib
 import json
 import os
 import re
 import secrets
+import socket
 import ssl
+import subprocess
 import sys
 import textwrap
 import time
@@ -23,7 +26,7 @@ from typing import Any
 
 
 APP_NAME = "OAST Community"
-VERSION = "1.0.0"
+VERSION = "1.4.0"
 
 ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 
@@ -32,7 +35,7 @@ DEFAULT_POLL_HOST = "polling.oastify.com"
 DEFAULT_INTERVAL = 5.0
 DEFAULT_TIMEOUT = 15.0
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 STATE_DIR = Path.home() / ".oast-community"
 
 RESET = "\033[0m"
@@ -53,8 +56,13 @@ class Console:
         self,
         no_color: bool = False,
         debug_enabled: bool = False,
+        stream: Any = None,
     ) -> None:
-        self.no_color = no_color or not sys.stdout.isatty()
+        self.stream = stream or sys.stdout
+        self.no_color = (
+            no_color
+            or not self.stream.isatty()
+        )
         self.debug_enabled = debug_enabled
 
     def color(
@@ -89,6 +97,7 @@ class Console:
             f"{self.color(marker, color)} "
             f"{message}",
             flush=True,
+            file=self.stream,
         )
 
     def info(
@@ -267,6 +276,14 @@ def pause() -> None:
 # Data models
 # ============================================================
 
+def now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 @dataclass(
     frozen=True
 )
@@ -281,14 +298,62 @@ class Config:
 
 
 @dataclass
+class PayloadRecord:
+    number: int
+    interaction_id: str
+    created: str
+    note: str = ""
+    label: str = ""
+    prefixes: list[str] = field(
+        default_factory=list
+    )
+    interactions: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+
+    def __post_init__(self) -> None:
+        self._fingerprints: set[str] = {
+            interaction_fingerprint(item)
+            for item in self.interactions
+        }
+
+    def add(
+        self,
+        interaction: dict[str, Any],
+    ) -> bool:
+        fingerprint = interaction_fingerprint(
+            interaction
+        )
+
+        if fingerprint in self._fingerprints:
+            return False
+
+        self._fingerprints.add(fingerprint)
+        self.interactions.append(interaction)
+
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "number": self.number,
+            "interaction_id": self.interaction_id,
+            "created": self.created,
+            "note": self.note,
+            "label": self.label,
+            "prefixes": self.prefixes,
+            "interactions": self.interactions,
+        }
+
+
+@dataclass
 class ClientContext:
     biid: str
 
     counter: int = 0
 
-    payloads: dict[
+    records: dict[
         str,
-        int,
+        PayloadRecord,
     ] = field(
         default_factory=dict
     )
@@ -344,9 +409,69 @@ class ClientContext:
         ):
             return None
 
-        return self.payloads.get(
+        record = self.records.get(
             interaction_id
         )
+
+        if record is None or record.number <= 0:
+            return None
+
+        return record.number
+
+    def hostname_for(
+        self,
+        record: PayloadRecord,
+        config: Config,
+    ) -> str:
+        return (
+            f"{record.interaction_id}."
+            f"{config.domain}"
+        )
+
+    def sorted_records(
+        self,
+    ) -> list[PayloadRecord]:
+        return sorted(
+            self.records.values(),
+            key=lambda record: (
+                record.number
+                if record.number > 0
+                else 10**9
+            ),
+        )
+
+    def ingest(
+        self,
+        interactions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        new_items: list[dict[str, Any]] = []
+
+        for interaction in interactions:
+
+            interaction_id = str(
+                interaction.get(
+                    "interactionString",
+                    "unknown",
+                )
+            )
+
+            record = self.records.get(
+                interaction_id
+            )
+
+            if record is None:
+                record = PayloadRecord(
+                    number=0,
+                    interaction_id=interaction_id,
+                    created=now_iso(),
+                    label="orphan",
+                )
+                self.records[interaction_id] = record
+
+            if record.add(interaction):
+                new_items.append(interaction)
+
+        return new_items
 
     def latest_payload(
         self,
@@ -355,23 +480,26 @@ class ClientContext:
         int,
         str,
     ] | None:
-        if not self.payloads:
+        generated = [
+            record
+            for record in self.records.values()
+            if record.number > 0
+        ]
+
+        if not generated:
             return None
 
-        interaction_id = max(
-            self.payloads,
-            key=self.payloads.get,
-        )
-
-        number = (
-            self.payloads[
-                interaction_id
-            ]
+        record = max(
+            generated,
+            key=lambda item: item.number,
         )
 
         return (
-            number,
-            f"{interaction_id}.{config.domain}",
+            record.number,
+            self.hostname_for(
+                record,
+                config,
+            ),
         )
 
     def to_dict(
@@ -397,8 +525,11 @@ class ClientContext:
             "counter":
                 self.counter,
 
-            "payloads":
-                self.payloads,
+            "records": {
+                interaction_id: record.to_dict()
+                for interaction_id, record
+                in self.records.items()
+            },
         }
 
     @classmethod
@@ -410,12 +541,11 @@ class ClientContext:
         ],
         config: Config,
     ) -> "ClientContext":
-        if (
-            data.get(
-                "version"
-            )
-            != STATE_VERSION
-        ):
+        version = data.get(
+            "version"
+        )
+
+        if version not in (1, STATE_VERSION):
             raise ValueError(
                 "Unsupported state version"
             )
@@ -442,10 +572,6 @@ class ClientContext:
 
         counter = data.get(
             "counter"
-        )
-
-        payloads = data.get(
-            "payloads"
         )
 
         if not isinstance(
@@ -480,6 +606,39 @@ class ClientContext:
                 "Invalid payload counter"
             )
 
+        records: dict[str, PayloadRecord] = {}
+
+        if version == 1:
+            records = cls._migrate_v1_payloads(
+                data.get("payloads")
+            )
+
+        else:
+            records = cls._load_records(
+                data.get("records")
+            )
+
+        highest = max(
+            (
+                record.number
+                for record in records.values()
+                if record.number > 0
+            ),
+            default=0,
+        )
+
+        counter = max(counter, highest)
+
+        return cls(
+            biid=biid,
+            counter=counter,
+            records=records,
+        )
+
+    @staticmethod
+    def _migrate_v1_payloads(
+        payloads: Any,
+    ) -> dict[str, PayloadRecord]:
         if not isinstance(
             payloads,
             dict,
@@ -488,10 +647,7 @@ class ClientContext:
                 "Invalid payload registry"
             )
 
-        clean_payloads: dict[
-            str,
-            int,
-        ] = {}
+        records: dict[str, PayloadRecord] = {}
 
         for (
             interaction_id,
@@ -499,34 +655,82 @@ class ClientContext:
         ) in payloads.items():
 
             if (
-                isinstance(
-                    interaction_id,
-                    str,
-                )
+                isinstance(interaction_id, str)
                 and interaction_id
-                and isinstance(
-                    number,
-                    int,
-                )
+                and isinstance(number, int)
                 and number > 0
             ):
-                clean_payloads[
-                    interaction_id
-                ] = number
+                records[interaction_id] = PayloadRecord(
+                    number=number,
+                    interaction_id=interaction_id,
+                    created="unknown",
+                )
 
-        if clean_payloads:
-            counter = max(
-                counter,
-                max(
-                    clean_payloads.values()
-                ),
+        return records
+
+    @staticmethod
+    def _load_records(
+        raw: Any,
+    ) -> dict[str, PayloadRecord]:
+        if not isinstance(
+            raw,
+            dict,
+        ):
+            raise ValueError(
+                "Invalid payload registry"
             )
 
-        return cls(
-            biid=biid,
-            counter=counter,
-            payloads=clean_payloads,
-        )
+        records: dict[str, PayloadRecord] = {}
+
+        for interaction_id, entry in raw.items():
+
+            if (
+                not isinstance(interaction_id, str)
+                or not interaction_id
+                or not isinstance(entry, dict)
+            ):
+                continue
+
+            number = entry.get("number", 0)
+
+            if not isinstance(number, int) or number < 0:
+                number = 0
+
+            interactions = entry.get("interactions")
+
+            if not isinstance(interactions, list):
+                interactions = []
+
+            interactions = [
+                item
+                for item in interactions
+                if isinstance(item, dict)
+            ]
+
+            prefixes = entry.get("prefixes")
+
+            if not isinstance(prefixes, list):
+                prefixes = []
+
+            prefixes = [
+                item
+                for item in prefixes
+                if isinstance(item, str) and item
+            ]
+
+            records[interaction_id] = PayloadRecord(
+                number=number,
+                interaction_id=interaction_id,
+                created=str(
+                    entry.get("created", "unknown")
+                ),
+                note=str(entry.get("note", "")),
+                label=str(entry.get("label", "")),
+                prefixes=prefixes,
+                interactions=interactions,
+            )
+
+        return records
 
 
 # ============================================================
@@ -770,9 +974,13 @@ class CollaboratorClient:
 
         self.context.counter += 1
 
-        self.context.payloads[
+        self.context.records[
             interaction_id
-        ] = number
+        ] = PayloadRecord(
+            number=number,
+            interaction_id=interaction_id,
+            created=now_iso(),
+        )
 
         hostname = (
             f"{interaction_id}."
@@ -958,6 +1166,89 @@ def validate_hostname(
     return value
 
 
+def validate_prefix(
+    value: str,
+) -> str:
+    value = (
+        value
+        .strip()
+        .strip(".")
+        .lower()
+    )
+
+    if not value:
+        raise ValueError(
+            "Prefix must not be empty"
+        )
+
+    if "://" in value or "/" in value:
+        raise ValueError(
+            "Prefix must be a DNS label chain"
+        )
+
+    for label in value.split("."):
+
+        if (
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or not label.isascii()
+            or not all(
+                character.isalnum()
+                or character == "-"
+                for character in label
+            )
+        ):
+            raise ValueError(
+                "Invalid prefix "
+                "(use a-z, 0-9, - and .)"
+            )
+
+    return value
+
+
+def build_prefixed_host(
+    prefix: str,
+    interaction_id: str,
+    domain: str,
+) -> str:
+    hostname = (
+        f"{prefix}."
+        f"{interaction_id}."
+        f"{domain}"
+    )
+
+    if len(hostname) > 253:
+        raise ValueError(
+            "Resulting hostname exceeds "
+            "253 characters"
+        )
+
+    return hostname
+
+
+def extract_prefix(
+    queried: Any,
+    interaction_id: str,
+) -> str:
+    if not isinstance(queried, str) or not queried:
+        return ""
+
+    name = queried.strip().strip(".").lower()
+
+    marker = interaction_id.lower()
+
+    position = name.find(marker)
+
+    if position <= 0:
+        return ""
+
+    prefix = name[:position].rstrip(".")
+
+    return prefix
+
+
 def get_state_path(
     domain: str,
     poll_host: str,
@@ -980,6 +1271,56 @@ def get_state_path(
     )
 
 
+def harden_permissions(
+    path: Path,
+    directory: bool = False,
+) -> None:
+    """Restrict a state path to the current user only.
+
+    On POSIX this is chmod 0700/0600. On Windows, where chmod is
+    effectively a no-op, reset ACL inheritance and grant full access
+    only to the current user via icacls.
+    """
+    if os.name == "nt":
+
+        try:
+            user = getpass.getuser()
+
+        except Exception:
+            return
+
+        command = [
+            "icacls",
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"{user}:(OI)(CI)F" if directory else f"{user}:F",
+        ]
+
+        try:
+            subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        return
+
+    try:
+        os.chmod(
+            path,
+            0o700 if directory else 0o600,
+        )
+
+    except OSError:
+        pass
+
+
 def save_context(
     context: ClientContext,
     config: Config,
@@ -987,19 +1328,18 @@ def save_context(
     if config.state_file is None:
         return
 
+    created_dir = not config.state_file.parent.exists()
+
     config.state_file.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    try:
-        os.chmod(
+    if created_dir:
+        harden_permissions(
             config.state_file.parent,
-            0o700,
+            directory=True,
         )
-
-    except OSError:
-        pass
 
     temporary = (
         config.state_file
@@ -1019,27 +1359,13 @@ def save_context(
         encoding="utf-8",
     )
 
-    try:
-        os.chmod(
-            temporary,
-            0o600,
-        )
-
-    except OSError:
-        pass
+    harden_permissions(temporary)
 
     temporary.replace(
         config.state_file
     )
 
-    try:
-        os.chmod(
-            config.state_file,
-            0o600,
-        )
-
-    except OSError:
-        pass
+    harden_permissions(config.state_file)
 
 
 def backup_invalid_state(
@@ -1341,6 +1667,140 @@ def interaction_source(
     return (
         f"{host}:"
         f"{port}"
+    )
+
+
+def interaction_queried_name(
+    interaction: dict[
+        str,
+        Any,
+    ],
+) -> str:
+    data = interaction.get("data")
+
+    if not isinstance(data, dict):
+        data = {}
+
+    protocol = str(
+        interaction.get("protocol", "")
+    ).lower()
+
+    if protocol == "dns":
+        sub = data.get("subDomain")
+
+        return sub if isinstance(sub, str) else ""
+
+    request = decode_base64_text(
+        data.get("request")
+    )
+
+    for raw_line in request.splitlines():
+
+        if raw_line.lower().startswith("host:"):
+            return raw_line.split(":", 1)[1].strip()
+
+    return ""
+
+
+def interaction_contexts(
+    interactions: list[
+        dict[
+            str,
+            Any,
+        ]
+    ],
+    interaction_id: str,
+) -> list[str]:
+    found: set[str] = set()
+
+    for item in interactions:
+
+        prefix = extract_prefix(
+            interaction_queried_name(item),
+            interaction_id,
+        )
+
+        if prefix:
+            found.add(prefix)
+
+    return sorted(found)
+
+
+def smtp_conversation(
+    data: dict[
+        str,
+        Any,
+    ],
+) -> str:
+    for key in (
+        "conversation",
+        "message",
+        "request",
+    ):
+        text = decode_base64_text(
+            data.get(key)
+        )
+
+        if text:
+            return text
+
+    return ""
+
+
+def parse_smtp(
+    conversation: str,
+) -> tuple[
+    str,
+    list[str],
+    str,
+]:
+    sender = ""
+    recipients: list[str] = []
+
+    lines = conversation.splitlines()
+
+    in_data = False
+    body_lines: list[str] = []
+
+    for raw_line in lines:
+
+        stripped = raw_line.strip()
+        lowered = stripped.lower()
+
+        if in_data:
+
+            if stripped == ".":
+                in_data = False
+                continue
+
+            if (
+                not body_lines
+                and re.match(r"^\d{3}[ -]", stripped)
+            ):
+                # Skip the server's 354 "start mail input" reply.
+                continue
+
+            body_lines.append(raw_line)
+            continue
+
+        if lowered.startswith("mail from:"):
+            sender = stripped.split(":", 1)[1].strip()
+
+        elif lowered.startswith("rcpt to:"):
+            recipient = stripped.split(":", 1)[1].strip()
+
+            if recipient:
+                recipients.append(recipient)
+
+        elif lowered == "data":
+            in_data = True
+
+    body = "\n".join(body_lines).strip()
+
+    return (
+        sender,
+        recipients,
+        body,
     )
 
 
@@ -1657,6 +2117,22 @@ def render_payload_box(
         }
     ]
 
+    smtp_items = [
+        item
+        for item
+        in interactions
+        if str(
+            item.get(
+                "protocol",
+                "",
+            )
+        ).lower()
+        in {
+            "smtp",
+            "smtps",
+        }
+    ]
+
     other_items = [
         item
         for item
@@ -1671,6 +2147,8 @@ def render_payload_box(
             "dns",
             "http",
             "https",
+            "smtp",
+            "smtps",
         }
     ]
 
@@ -1713,6 +2191,41 @@ def render_payload_box(
             width
         )
     )
+
+    contexts = interaction_contexts(
+        interactions,
+        interaction_id,
+    )
+
+    if contexts:
+
+        context_text = (
+            "Context    "
+            + ", ".join(contexts)
+        )
+
+        for line in wrap_box_text(
+            context_text,
+            width,
+            indent="  ",
+        ):
+
+            print(
+                box_line(
+                    console.color(
+                        line,
+                        YELLOW,
+                    ),
+                    width,
+                )
+            )
+
+        print(
+            box_line(
+                "",
+                width,
+            )
+        )
 
     if dns_items:
 
@@ -1945,6 +2458,144 @@ def render_payload_box(
                                 width,
                             )
                         )
+
+    for (
+        index,
+        item,
+    ) in enumerate(
+        smtp_items
+    ):
+
+        if (
+            dns_items
+            or http_items
+            or index > 0
+        ):
+
+            print(
+                box_line(
+                    "",
+                    width,
+                )
+            )
+
+        protocol = str(
+            item.get(
+                "protocol",
+                "smtp",
+            )
+        ).upper()
+
+        print(
+            box_line(
+                "  "
+                + console.color(
+                    protocol,
+                    BOLD + GREEN,
+                ),
+                width,
+            )
+        )
+
+        print(
+            box_line(
+                (
+                    "  Time      "
+                    + format_time(
+                        item.get(
+                            "time"
+                        )
+                    )
+                ),
+                width,
+            )
+        )
+
+        print(
+            box_line(
+                (
+                    "  Source    "
+                    + interaction_source(
+                        item
+                    )
+                ),
+                width,
+            )
+        )
+
+        data = item.get(
+            "data"
+        )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            data = {}
+
+        conversation = smtp_conversation(
+            data
+        )
+
+        (
+            sender,
+            recipients,
+            body,
+        ) = parse_smtp(
+            conversation
+        )
+
+        if sender:
+            print(
+                box_line(
+                    "  From      " + sender,
+                    width,
+                )
+            )
+
+        if recipients:
+            for line in wrap_box_text(
+                "To        "
+                + ", ".join(recipients),
+                width,
+                indent="  ",
+            ):
+                print(
+                    box_line(
+                        line,
+                        width,
+                    )
+                )
+
+        shown = body or conversation
+
+        if shown:
+
+            print(
+                box_line(
+                    "",
+                    width,
+                )
+            )
+
+            for raw_line in (
+                shown
+                .rstrip()
+                .splitlines()
+            ):
+
+                for line in wrap_box_text(
+                    raw_line,
+                    width,
+                    indent="    ",
+                ):
+
+                    print(
+                        box_line(
+                            line,
+                            width,
+                        )
+                    )
 
     for item in other_items:
 
@@ -2240,13 +2891,24 @@ def print_menu(
         )
     )
 
-    payload_count = len(
-        context.payloads
+    payload_count = sum(
+        1
+        for record in context.records.values()
+        if record.number > 0
+    )
+
+    stored = sum(
+        len(record.interactions)
+        for record in context.records.values()
     )
 
     payloads_line = (
         f"  Payloads  "
         f"{payload_count}"
+        + console.color(
+            f"   Interactions  {stored}",
+            DIM,
+        )
     )
 
     if latest is None:
@@ -2278,6 +2940,7 @@ def print_menu(
         "  [1] New payload",
         "  [2] Poll now",
         "  [3] Listen",
+        "  [4] Payloads",
         "  [0] Exit",
     ]
 
@@ -2418,7 +3081,16 @@ def action_poll(
         pause()
         return
 
-    if not interactions:
+    stored = client.context.ingest(
+        interactions
+    )
+
+    save_context(
+        client.context,
+        client.config,
+    )
+
+    if not stored:
 
         console.info(
             "No new interactions"
@@ -2430,7 +3102,7 @@ def action_poll(
 
     print_interaction_batch(
         client.context,
-        interactions,
+        stored,
     )
 
     print("")
@@ -2451,10 +3123,6 @@ def action_listen(
         "Ctrl+C to return"
     )
 
-    seen: set[
-        str
-    ] = set()
-
     try:
 
         while True:
@@ -2467,33 +3135,18 @@ def action_listen(
 
             if interactions:
 
-                new_interactions: list[
-                    dict[
-                        str,
-                        Any,
-                    ]
-                ] = []
-
-                for interaction in interactions:
-
-                    fingerprint = (
-                        interaction_fingerprint(
-                            interaction
-                        )
+                new_interactions = (
+                    client.context.ingest(
+                        interactions
                     )
-
-                    if fingerprint in seen:
-                        continue
-
-                    seen.add(
-                        fingerprint
-                    )
-
-                    new_interactions.append(
-                        interaction
-                    )
+                )
 
                 if new_interactions:
+
+                    save_context(
+                        client.context,
+                        client.config,
+                    )
 
                     print_interaction_batch(
                         client.context,
@@ -2514,6 +3167,890 @@ def action_listen(
 
 
 # ============================================================
+# Payload browser
+# ============================================================
+
+_RDNS_CACHE: dict[str, str] = {}
+
+
+def short_host(
+    interaction_id: str,
+    config: Config,
+    keep: int = 10,
+) -> str:
+    if len(interaction_id) > keep:
+        ident = interaction_id[:keep] + "…"
+    else:
+        ident = interaction_id
+
+    return f"{ident}.{config.domain}"
+
+
+def reverse_dns(
+    ip: str,
+    timeout: float,
+) -> str:
+    if ip in _RDNS_CACHE:
+        return _RDNS_CACHE[ip]
+
+    result = ""
+
+    previous = socket.getdefaulttimeout()
+
+    try:
+        socket.setdefaulttimeout(timeout)
+        result = socket.gethostbyaddr(ip)[0]
+
+    except (OSError, socket.herror, socket.gaierror):
+        result = ""
+
+    finally:
+        socket.setdefaulttimeout(previous)
+
+    _RDNS_CACHE[ip] = result
+
+    return result
+
+
+def interaction_sources(
+    record: PayloadRecord,
+) -> list[str]:
+    seen: list[str] = []
+
+    for item in record.interactions:
+
+        client = item.get("client")
+
+        if not isinstance(client, str) or not client:
+            continue
+
+        if client not in seen:
+            seen.append(client)
+
+    return seen
+
+
+def raw_report(
+    context: ClientContext,
+    record: PayloadRecord,
+    config: Config,
+) -> str:
+    hostname = context.hostname_for(
+        record,
+        config,
+    )
+
+    lines: list[str] = []
+
+    header = (
+        f"Payload #{record.number}"
+        if record.number > 0
+        else "Orphan payload"
+    )
+
+    lines.append(f"{header}  {hostname}")
+    lines.append(f"Created: {record.created}")
+
+    if record.label:
+        lines.append(f"Label: {record.label}")
+
+    if record.note:
+        lines.append(f"Note: {record.note}")
+
+    if record.prefixes:
+        lines.append(
+            "Prefixes: " + ", ".join(record.prefixes)
+        )
+
+    lines.append(
+        f"Interactions: {len(record.interactions)}"
+    )
+
+    lines.append("")
+
+    for index, item in enumerate(
+        record.interactions,
+        start=1,
+    ):
+
+        protocol = str(
+            item.get("protocol", "unknown")
+        ).upper()
+
+        lines.append(
+            f"[{index}] {protocol}  "
+            f"{format_time(item.get('time'))}  "
+            f"{interaction_source(item)}"
+        )
+
+        data = item.get("data")
+
+        if not isinstance(data, dict):
+            data = {}
+
+        if protocol == "DNS":
+            lines.append(
+                "    Type:  "
+                + dns_type_name(data.get("type"))
+            )
+
+            query = data.get("subDomain")
+
+            if isinstance(query, str) and query:
+                lines.append("    Query: " + query)
+
+        elif protocol in ("SMTP", "SMTPS"):
+            conversation = smtp_conversation(data)
+
+            if conversation:
+                lines.append("    --- conversation ---")
+                lines.extend(
+                    "    " + line
+                    for line in conversation
+                    .rstrip()
+                    .splitlines()
+                )
+
+        else:
+            request = decode_base64_text(
+                data.get("request")
+            )
+
+            response = decode_base64_text(
+                data.get("response")
+            )
+
+            if request:
+                lines.append("    --- request ---")
+                lines.extend(
+                    "    " + line
+                    for line in request
+                    .rstrip()
+                    .splitlines()
+                )
+
+            if response:
+                lines.append("    --- response ---")
+                lines.extend(
+                    "    " + line
+                    for line in response
+                    .rstrip()
+                    .splitlines()
+                )
+
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_payload_list(
+    context: ClientContext,
+    config: Config,
+) -> None:
+    records = context.sorted_records()
+
+    width = 76
+
+    print("")
+    print(box_top(width))
+
+    print(
+        box_line(
+            "  "
+            + console.color(
+                "Payloads",
+                BOLD,
+            ),
+            width,
+        )
+    )
+
+    print(box_separator(width))
+
+    for record in records:
+
+        if record.number > 0:
+            tag = console.color(
+                f"#{record.number}",
+                BOLD + GREEN,
+            )
+        else:
+            tag = console.color(
+                "orphan",
+                YELLOW,
+            )
+
+        counts = protocol_counts(
+            record.interactions
+        )
+
+        summary = (
+            summary_text(counts)
+            or "no hits"
+        )
+
+        meta = record.label or record.note
+
+        line = (
+            "  "
+            + tag
+            + "  "
+            + short_host(
+                record.interaction_id,
+                config,
+            )
+            + "  "
+            + console.color(
+                "· " + summary,
+                DIM,
+            )
+        )
+
+        if meta:
+            line += "  " + console.color(
+                "[" + meta + "]",
+                CYAN,
+            )
+
+        print(
+            box_line(
+                line,
+                width,
+            )
+        )
+
+    print(box_bottom(width))
+    print("")
+
+
+def payload_detail(
+    client: CollaboratorClient,
+    record: PayloadRecord,
+) -> None:
+    context = client.context
+    config = client.config
+
+    while True:
+
+        hostname = context.hostname_for(
+            record,
+            config,
+        )
+
+        print("")
+
+        label = (
+            f"Payload #{record.number}"
+            if record.number > 0
+            else "Orphan payload"
+        )
+
+        console.info(label)
+
+        print(
+            "  "
+            + console.color(
+                hostname,
+                BOLD + CYAN,
+            )
+        )
+
+        print(
+            "  "
+            + console.color(
+                "http://" + hostname + "/",
+                DIM,
+            )
+        )
+
+        print(
+            "  "
+            + console.color(
+                "https://" + hostname + "/",
+                DIM,
+            )
+        )
+
+        print(
+            "  Created  "
+            + console.color(
+                record.created,
+                DIM,
+            )
+        )
+
+        if record.label:
+            print("  Label    " + record.label)
+
+        if record.note:
+            print("  Note     " + record.note)
+
+        if record.prefixes:
+            print(
+                "  Prefixes "
+                + console.color(
+                    ", ".join(record.prefixes),
+                    YELLOW,
+                )
+            )
+
+        if record.interactions:
+            render_payload_box(
+                context,
+                record.interaction_id,
+                record.interactions,
+            )
+        else:
+            print("")
+            console.info(
+                "No interactions stored yet"
+            )
+
+        print("")
+        print(
+            console.color(
+                "  [p] prefixed   "
+                "[r] raw   "
+                "[s] save   "
+                "[d] resolve   "
+                "[n] note   "
+                "[l] label   "
+                "[b] back",
+                DIM,
+            )
+        )
+
+        try:
+            choice = input(
+                console.color("Select", BOLD)
+                + " > "
+            ).strip().lower()
+
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            return
+
+        if choice in ("b", "0", ""):
+            return
+
+        if choice == "p":
+            build_prefixed_payload(
+                client,
+                record,
+            )
+
+        elif choice == "r":
+            show_raw_report(
+                client,
+                record,
+            )
+
+        elif choice == "s":
+            save_raw_report(
+                client,
+                record,
+            )
+
+        elif choice == "d":
+            resolve_sources(
+                client,
+                record,
+            )
+
+        elif choice == "n":
+            record.note = _prompt_text(
+                "Note (blank to clear)"
+            )
+            save_context(context, config)
+            console.ok("Note updated")
+
+        elif choice == "l":
+            record.label = _prompt_text(
+                "Label (blank to clear)"
+            )
+            save_context(context, config)
+            console.ok("Label updated")
+
+        else:
+            console.warn("Invalid option")
+
+
+def build_prefixed_payload(
+    client: CollaboratorClient,
+    record: PayloadRecord,
+) -> None:
+    context = client.context
+    config = client.config
+
+    raw = _prompt_text(
+        "Prefix (e.g. login-ssrf)"
+    )
+
+    if not raw:
+        console.warn("Cancelled")
+        return
+
+    try:
+        prefix = validate_prefix(raw)
+
+        prefixed = build_prefixed_host(
+            prefix,
+            record.interaction_id,
+            config.domain,
+        )
+
+    except ValueError as error:
+        console.error(str(error))
+        return
+
+    if prefix not in record.prefixes:
+        record.prefixes.append(prefix)
+        save_context(context, config)
+
+    print("")
+    console.ok(
+        "Prefixed payload (reuses this id)"
+    )
+
+    print("")
+
+    print(
+        "  "
+        + console.color(
+            prefixed,
+            BOLD + CYAN,
+        )
+    )
+
+    print(
+        "  "
+        + console.color(
+            "http://" + prefixed + "/",
+            DIM,
+        )
+    )
+
+    print(
+        "  "
+        + console.color(
+            "https://" + prefixed + "/",
+            DIM,
+        )
+    )
+
+    print("")
+
+    pause()
+
+
+def show_raw_report(
+    client: CollaboratorClient,
+    record: PayloadRecord,
+) -> None:
+    if not record.interactions:
+        console.info("No interactions stored yet")
+        print("")
+        pause()
+        return
+
+    report = raw_report(
+        client.context,
+        record,
+        client.config,
+    )
+
+    print("")
+    print(report)
+
+    pause()
+
+
+def save_raw_report(
+    client: CollaboratorClient,
+    record: PayloadRecord,
+) -> None:
+    if not record.interactions:
+        console.info("No interactions stored yet")
+        print("")
+        pause()
+        return
+
+    report = raw_report(
+        client.context,
+        record,
+        client.config,
+    )
+
+    timestamp = (
+        datetime.now(timezone.utc)
+        .strftime("%Y%m%dT%H%M%SZ")
+    )
+
+    tag = (
+        f"{record.number}"
+        if record.number > 0
+        else record.interaction_id[:10]
+    )
+
+    filename = Path(
+        f"oast-payload-{tag}-{timestamp}.txt"
+    )
+
+    try:
+        filename.write_text(
+            report,
+            encoding="utf-8",
+        )
+
+    except OSError as error:
+        console.error(
+            f"Could not write report: {error}"
+        )
+        print("")
+        pause()
+        return
+
+    console.ok(
+        f"Saved report to {filename}"
+    )
+
+    print("")
+
+    pause()
+
+
+def resolve_sources(
+    client: CollaboratorClient,
+    record: PayloadRecord,
+) -> None:
+    sources = interaction_sources(record)
+
+    if not sources:
+        console.info("No source addresses stored")
+        print("")
+        pause()
+        return
+
+    console.info(
+        f"Resolving {len(sources)} source "
+        f"address{'' if len(sources) == 1 else 'es'}"
+    )
+
+    print("")
+
+    for ip in sources:
+
+        name = reverse_dns(
+            ip,
+            client.config.timeout,
+        )
+
+        print(
+            "  "
+            + console.color(
+                ip.ljust(18),
+                CYAN,
+            )
+            + (
+                name
+                if name
+                else console.color(
+                    "no PTR record",
+                    DIM,
+                )
+            )
+        )
+
+    print("")
+
+    pause()
+
+
+def _prompt_text(
+    prompt: str,
+) -> str:
+    try:
+        return input(
+            console.color(prompt, BOLD)
+            + " > "
+        ).strip()
+
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return ""
+
+
+def action_payloads(
+    client: CollaboratorClient,
+) -> None:
+    context = client.context
+    config = client.config
+
+    while True:
+
+        records = context.sorted_records()
+
+        if not records:
+            console.info("No payloads yet")
+            print("")
+            pause()
+            return
+
+        render_payload_list(context, config)
+
+        try:
+            choice = input(
+                console.color(
+                    "Payload # (b to back)",
+                    BOLD,
+                )
+                + " > "
+            ).strip().lower()
+
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            return
+
+        if choice in ("b", "0", ""):
+            return
+
+        if not choice.isdigit():
+            console.warn("Invalid option")
+            continue
+
+        number = int(choice)
+
+        match = next(
+            (
+                record
+                for record in records
+                if record.number == number
+            ),
+            None,
+        )
+
+        if match is None:
+            console.warn(
+                f"No payload #{number}"
+            )
+            continue
+
+        payload_detail(client, match)
+
+
+# ============================================================
+# Non-interactive commands
+# ============================================================
+
+def filter_by_protocol(
+    interactions: list[
+        dict[
+            str,
+            Any,
+        ]
+    ],
+    protocols: set[str] | None,
+) -> list[
+    dict[
+        str,
+        Any,
+    ]
+]:
+    if not protocols:
+        return interactions
+
+    return [
+        item
+        for item in interactions
+        if str(
+            item.get("protocol", "")
+        ).lower()
+        in protocols
+    ]
+
+
+def interaction_json(
+    context: ClientContext,
+    interaction: dict[
+        str,
+        Any,
+    ],
+) -> dict[str, Any]:
+    interaction_id = str(
+        interaction.get(
+            "interactionString",
+            "",
+        )
+    )
+
+    return {
+        "payload_number":
+            context.payload_number(interaction_id),
+        "interaction_id":
+            interaction_id,
+        "protocol":
+            str(interaction.get("protocol", "")),
+        "time":
+            format_time(interaction.get("time")),
+        "source":
+            interaction_source(interaction),
+        "queried_name":
+            interaction_queried_name(interaction),
+        "prefix":
+            extract_prefix(
+                interaction_queried_name(interaction),
+                interaction_id,
+            ),
+        "raw":
+            interaction,
+    }
+
+
+def cmd_new(
+    client: CollaboratorClient,
+    as_json: bool,
+) -> int:
+    number, hostname = client.generate_payload()
+
+    save_context(
+        client.context,
+        client.config,
+    )
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "number": number,
+                    "host": hostname,
+                    "dns": hostname,
+                    "http": f"http://{hostname}/",
+                    "https": f"https://{hostname}/",
+                }
+            )
+        )
+
+    else:
+        print(hostname)
+
+    return 0
+
+
+def cmd_poll(
+    client: CollaboratorClient,
+    as_json: bool,
+    protocols: set[str] | None,
+) -> int:
+    interactions = poll_safely(client)
+
+    if interactions is None:
+
+        if as_json:
+            print("[]")
+
+        return 1
+
+    stored = client.context.ingest(interactions)
+
+    save_context(
+        client.context,
+        client.config,
+    )
+
+    stored = filter_by_protocol(
+        stored,
+        protocols,
+    )
+
+    if as_json:
+        print(
+            json.dumps(
+                [
+                    interaction_json(
+                        client.context,
+                        item,
+                    )
+                    for item in stored
+                ],
+                indent=2,
+            )
+        )
+
+        return 0
+
+    if not stored:
+        console.info("No new interactions")
+        return 0
+
+    print_interaction_batch(
+        client.context,
+        stored,
+    )
+
+    return 0
+
+
+def cmd_list(
+    client: CollaboratorClient,
+    as_json: bool,
+) -> int:
+    records = client.context.sorted_records()
+
+    if as_json:
+
+        payload = [
+            {
+                "number":
+                    record.number
+                    if record.number > 0
+                    else None,
+                "interaction_id":
+                    record.interaction_id,
+                "host":
+                    client.context.hostname_for(
+                        record,
+                        client.config,
+                    ),
+                "created":
+                    record.created,
+                "label":
+                    record.label,
+                "note":
+                    record.note,
+                "prefixes":
+                    record.prefixes,
+                "protocols":
+                    protocol_counts(
+                        record.interactions
+                    ),
+                "interactions":
+                    len(record.interactions),
+            }
+            for record in records
+        ]
+
+        print(
+            json.dumps(
+                payload,
+                indent=2,
+            )
+        )
+
+        return 0
+
+    if not records:
+        console.info("No payloads yet")
+        return 0
+
+    render_payload_list(
+        client.context,
+        client.config,
+    )
+
+    return 0
+
+
+# ============================================================
 # CLI
 # ============================================================
 
@@ -2531,8 +4068,35 @@ def parse_args(
     )
 
     parser.add_argument(
+        "command",
+        nargs="?",
+        choices=[
+            "new",
+            "poll",
+            "list",
+        ],
+        help=(
+            "Optional one-shot action: "
+            "new (generate a payload), "
+            "poll (fetch interactions), "
+            "list (show payloads). "
+            "Omit for the interactive menu."
+        ),
+    )
+
+    parser.add_argument(
+        "--server",
+        default=None,
+        help=(
+            "Private Collaborator server host. "
+            "Sets both the payload domain and the "
+            "polling host unless overridden."
+        ),
+    )
+
+    parser.add_argument(
         "--domain",
-        default=DEFAULT_DOMAIN,
+        default=None,
         help=(
             "Payload domain. "
             f"Default: {DEFAULT_DOMAIN}"
@@ -2541,7 +4105,7 @@ def parse_args(
 
     parser.add_argument(
         "--poll-host",
-        default=DEFAULT_POLL_HOST,
+        default=None,
         help=(
             "Polling host. "
             f"Default: {DEFAULT_POLL_HOST}"
@@ -2571,21 +4135,50 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--new-context",
+        "--context",
+        choices=[
+            "persist",
+            "new",
+            "ephemeral",
+        ],
+        default="persist",
+        help=(
+            "Context lifecycle: persist (default, "
+            "reuse saved state), new (start a fresh "
+            "context), ephemeral (do not read or "
+            "write any state)."
+        ),
+    )
+
+    parser.add_argument(
+        "--protocol",
+        default=None,
+        help=(
+            "Comma-separated protocol filter for "
+            "poll output (e.g. dns,http,smtp)."
+        ),
+    )
+
+    parser.add_argument(
+        "--json",
         action="store_true",
         help=(
-            "Create a fresh persistent "
-            "client context before starting."
+            "Machine-readable JSON output for the "
+            "new, poll and list actions."
         ),
+    )
+
+    # Deprecated aliases, kept for compatibility.
+    parser.add_argument(
+        "--new-context",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
         "--no-state",
         action="store_true",
-        help=(
-            "Use an ephemeral context "
-            "and do not read or write state."
-        ),
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -2622,16 +4215,29 @@ def build_config(
     args: argparse.Namespace,
 ) -> Config:
 
+    server = (
+        validate_hostname(
+            args.server,
+            "server",
+        )
+        if args.server
+        else None
+    )
+
     domain = (
         validate_hostname(
-            args.domain,
+            args.domain
+            or server
+            or DEFAULT_DOMAIN,
             "domain",
         )
     )
 
     poll_host = (
         validate_hostname(
-            args.poll_host,
+            args.poll_host
+            or server
+            or DEFAULT_POLL_HOST,
             "poll host",
         )
     )
@@ -2650,9 +4256,14 @@ def build_config(
             "be greater than 0"
         )
 
+    ephemeral = (
+        args.no_state
+        or args.context == "ephemeral"
+    )
+
     state_file = (
         None
-        if args.no_state
+        if ephemeral
         else get_state_path(
             domain,
             poll_host,
@@ -2672,14 +4283,38 @@ def main(
 ) -> int:
     global console
 
+    for stream in (
+        sys.stdout,
+        sys.stderr,
+    ):
+        try:
+            stream.reconfigure(
+                encoding="utf-8",
+            )
+
+        except (AttributeError, ValueError):
+            pass
+
     args = (
         parse_args()
     )
 
-    console = Console(
-        no_color=args.no_color,
-        debug_enabled=args.debug,
-    )
+    as_json = args.json
+    command = args.command
+
+    if as_json and command:
+        # Keep stdout clean for JSON; logs go to stderr.
+        console = Console(
+            no_color=True,
+            debug_enabled=args.debug,
+            stream=sys.stderr,
+        )
+
+    else:
+        console = Console(
+            no_color=args.no_color,
+            debug_enabled=args.debug,
+        )
 
     try:
 
@@ -2699,22 +4334,39 @@ def main(
 
         return 2
 
-    if (
+    ephemeral = (
+        args.no_state
+        or args.context == "ephemeral"
+    )
+
+    new_requested = (
         args.new_context
-        and args.no_state
-    ):
+        or args.context == "new"
+    )
+
+    if new_requested and ephemeral:
 
         console.warn(
-            "--new-context has no effect "
-            "with --no-state"
+            "A new context has no effect "
+            "with an ephemeral context"
         )
+
+    protocols = (
+        {
+            part.strip().lower()
+            for part in args.protocol.split(",")
+            if part.strip()
+        }
+        if args.protocol
+        else None
+    )
 
     context = (
         load_context(
             config,
             new_context=(
-                args.new_context
-                and not args.no_state
+                new_requested
+                and not ephemeral
             ),
         )
     )
@@ -2748,6 +4400,19 @@ def main(
         f"Polling host: "
         f"{config.poll_host}"
     )
+
+    if command == "new":
+        return cmd_new(client, as_json)
+
+    if command == "poll":
+        return cmd_poll(
+            client,
+            as_json,
+            protocols,
+        )
+
+    if command == "list":
+        return cmd_list(client, as_json)
 
     while True:
 
@@ -2789,6 +4454,12 @@ def main(
         elif option == "3":
 
             action_listen(
+                client
+            )
+
+        elif option == "4":
+
+            action_payloads(
                 client
             )
 
